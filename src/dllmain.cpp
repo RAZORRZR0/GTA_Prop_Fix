@@ -7,21 +7,20 @@
 #include "../minhook/MinHook.h"
 
 // =======================================================================
-// GTA SA Definitive Edition - Street Props Ground & Vehicle Collision Fix v0.0.2
+// GTA SA Definitive Edition - Street Props & World Collision Fix v0.0.3
 //
-// Dual-Layer Architecture:
-// 1. FLUSH GROUND COLLIDER (100% Solid WorldStatic Barrier):
-//    - Blocks RemoveFloor permanently.
+// Features:
+// 1. FLUSH GROUND COLLIDER:
+//    - Permanently blocks RemoveFloor.
 //    - Transforms PhysicsFloor into a 150m x 150m x 0.2m flush road barrier.
-//    - Decoupled from actor hierarchy (KeepWorld).
-// 2. STANDALONE DYNAMIC VEHICLE COLLIDER (Phase 1):
-//    - Spawns an independent AActor with Owner = nullptr (no same-actor
-//      PhysX collision suppression).
-//    - Shapes it to car dimensions (2.2m x 4.8m x 1.4m), ECC_WorldDynamic,
-//      blocking ECC_PhysicsBody.
-//    - Kinematically translates it along the vehicle's velocity vector for
-//      2.5 seconds at 60 Hz so falling props bounce off the hood and roof!
-//    - Cleanly destroyed via K2_DestroyActor when the car clears the crash zone.
+// 2. ACTIVE MAP & ENVIRONMENT PHYSX ACTIVATOR (Houses, Footpaths & Traffic):
+//    - Sweeps a 35-meter bubble around the broken prop at impact.
+//    - Automatically activates QueryAndPhysics on all nearby StaticMeshComponents
+//      (houses, walls, sidewalk footpaths, curbs, and traffic cars).
+//    - Configures ECC_PhysicsBody -> ECR_Block so broken props physically
+//      collide with buildings, footpaths, and other cars!
+// 3. CONTINUOUS COLLISION DETECTION (CCD) & SUBSTEPPING:
+//    - Prevents tunneling through active geometry.
 // =======================================================================
 
 // RVAs for SanAndreas.exe
@@ -115,6 +114,7 @@ static void* g_fnK2_DetachFromComponent = nullptr;          // USceneComponent::
 static void* g_fnSetAbsolute = nullptr;                     // USceneComponent::SetAbsolute
 static void* g_fnSetWorldLocationAndRotation = nullptr;     // USceneComponent::K2_SetWorldLocationAndRotation
 static void* g_fnSetWorldScale3D = nullptr;                 // USceneComponent::SetWorldScale3D
+static void* g_fnGetComponentLocation = nullptr;           // USceneComponent::K2_GetComponentLocation
 static void* g_fnSetCollisionObjectType = nullptr;          // UPrimitiveComponent::SetCollisionObjectType
 static void* g_fnSetCollisionEnabled = nullptr;             // UPrimitiveComponent::SetCollisionEnabled
 static void* g_fnSetCollisionResponseToAllChannels = nullptr; // UPrimitiveComponent::SetCollisionResponseToAllChannels
@@ -124,12 +124,6 @@ static void* g_fnClearMoveIgnoreComponents = nullptr;       // UPrimitiveCompone
 static void* g_fnSetAllUseCCD = nullptr;                    // UPrimitiveComponent::SetAllUseCCD
 static void* g_fnSetStaticMesh = nullptr;                   // UStaticMeshComponent::SetStaticMesh
 static void* g_meshBreakableFloor = nullptr;                // StaticMesh Breakable_Floor
-
-// Spawning functions (UGameplayStatics / AActor)
-static void* g_fnBeginDeferredActorSpawn = nullptr;         // UGameplayStatics::BeginDeferredActorSpawnFromClass
-static void* g_fnFinishSpawningActor = nullptr;             // UGameplayStatics::FinishSpawningActor
-static void* g_fnK2_DestroyActor = nullptr;                 // AActor::K2_DestroyActor
-static void* g_classStaticMeshActor = nullptr;              // UClass StaticMeshActor
 
 static volatile bool g_bFunctionsResolved = false;
 
@@ -161,6 +155,9 @@ struct Parms_SetWorldLocationAndRotation {
 struct Parms_SetWorldScale3D {
     float NewScale[3];
 };
+struct Parms_GetComponentLocation {
+    float ReturnValue[3];
+};
 struct Parms_SetCollisionObjectType {
     uint8_t Channel; // 0 = ECC_WorldStatic, 1 = ECC_WorldDynamic
 };
@@ -185,90 +182,7 @@ struct Parms_SetStaticMesh {
     void* NewMesh;
     bool ReturnValue;
 };
-
-// Spawning structs
-struct Parms_BeginDeferredActorSpawnFromClass {
-    void* WorldContextObject;      // 0x00
-    void* ActorClass;              // 0x08
-    float SpawnTransform_Rot[4];   // 0x10 (X, Y, Z, W)
-    float SpawnTransform_Trans[3]; // 0x20 (X, Y, Z)
-    float SpawnTransform_Scale[3]; // 0x2C (X, Y, Z)
-    uint32_t Pad_38;
-    uint32_t Pad_3C;
-    uint8_t CollisionHandlingOverride; // 0x40 (1 = AlwaysSpawn)
-    uint8_t Pad_41[7];
-    void* Owner;                   // 0x48 (nullptr)
-    void* ReturnValue;             // 0x50 (AActor*)
-};
-struct Parms_FinishSpawningActor {
-    void* Actor;                   // 0x00
-    uint8_t Pad_08[8];
-    float SpawnTransform_Rot[4];   // 0x10
-    float SpawnTransform_Trans[3]; // 0x20
-    float SpawnTransform_Scale[3]; // 0x2C
-    uint32_t Pad_38;
-    uint32_t Pad_3C;
-    void* ReturnValue;             // 0x40
-};
 #pragma pack(pop)
-
-// ===== Active Standalone Vehicle Collider Tracker =====
-struct ActiveVehicleActor {
-    void* Actor;
-    void* TargetComp;
-    float PosX, PosY, PosZ;
-    float VelX, VelY;
-    float Yaw;
-    DWORD StartTime;
-    DWORD LastUpdateTime;
-    float DurationSec;
-    bool Active;
-};
-static const int MAX_VEHICLE_ACTORS = 4;
-static ActiveVehicleActor g_VehicleActors[MAX_VEHICLE_ACTORS] = {};
-
-static void UpdateActiveVehicleActors() {
-    if (!g_fnSetWorldLocationAndRotation || !pOriginalProcessEvent) return;
-    DWORD now = GetTickCount();
-
-    for (int i = 0; i < MAX_VEHICLE_ACTORS; ++i) {
-        if (!g_VehicleActors[i].Active || !g_VehicleActors[i].Actor) continue;
-
-        float elapsed = (now - g_VehicleActors[i].StartTime) / 1000.0f;
-        if (elapsed >= g_VehicleActors[i].DurationSec) {
-            // Clean up standalone vehicle actor
-            if (g_fnK2_DestroyActor) {
-                pOriginalProcessEvent(g_VehicleActors[i].Actor, g_fnK2_DestroyActor, nullptr);
-                Log("[GTA_Prop_Fix] Destroyed Standalone Vehicle Actor at 0x%p (elapsed=%.1fs).\n",
-                    g_VehicleActors[i].Actor, elapsed);
-            }
-            g_VehicleActors[i].Active = false;
-            g_VehicleActors[i].Actor = nullptr;
-            g_VehicleActors[i].TargetComp = nullptr;
-            continue;
-        }
-
-        DWORD deltaMs = now - g_VehicleActors[i].LastUpdateTime;
-        if (deltaMs < 16) continue;
-
-        float dt = deltaMs / 1000.0f;
-        g_VehicleActors[i].LastUpdateTime = now;
-        g_VehicleActors[i].PosX += g_VehicleActors[i].VelX * dt;
-        g_VehicleActors[i].PosY += g_VehicleActors[i].VelY * dt;
-
-        void* target = g_VehicleActors[i].TargetComp ? g_VehicleActors[i].TargetComp : g_VehicleActors[i].Actor;
-        Parms_SetWorldLocationAndRotation locRot{};
-        locRot.NewLocation[0] = g_VehicleActors[i].PosX;
-        locRot.NewLocation[1] = g_VehicleActors[i].PosY;
-        locRot.NewLocation[2] = g_VehicleActors[i].PosZ;
-        locRot.NewRotation[0] = 0.0f;
-        locRot.NewRotation[1] = g_VehicleActors[i].Yaw;
-        locRot.NewRotation[2] = 0.0f;
-        locRot.bSweep = false;
-        locRot.bTeleport = false; // Kinematic push: physically deflects dynamic rigid bodies!
-        pOriginalProcessEvent(target, g_fnSetWorldLocationAndRotation, &locRot);
-    }
-}
 
 // ===== Engine Function Resolution =====
 static void ResolveEngineFunctions() {
@@ -301,6 +215,9 @@ static void ResolveEngineFunctions() {
         } else if (!g_fnSetWorldScale3D && strcmp(nameBuf, "SetWorldScale3D") == 0) {
             g_fnSetWorldScale3D = obj;
             Log("[GTA_Prop_Fix]   Found SetWorldScale3D at 0x%p\n", obj);
+        } else if (!g_fnGetComponentLocation && strcmp(nameBuf, "K2_GetComponentLocation") == 0) {
+            g_fnGetComponentLocation = obj;
+            Log("[GTA_Prop_Fix]   Found K2_GetComponentLocation at 0x%p\n", obj);
         } else if (!g_fnSetCollisionObjectType && strcmp(nameBuf, "SetCollisionObjectType") == 0) {
             g_fnSetCollisionObjectType = obj;
             Log("[GTA_Prop_Fix]   Found SetCollisionObjectType at 0x%p\n", obj);
@@ -325,26 +242,6 @@ static void ResolveEngineFunctions() {
         } else if (!g_fnSetStaticMesh && strcmp(nameBuf, "SetStaticMesh") == 0) {
             g_fnSetStaticMesh = obj;
             Log("[GTA_Prop_Fix]   Found SetStaticMesh at 0x%p\n", obj);
-        } else if (!g_fnBeginDeferredActorSpawn && strcmp(nameBuf, "BeginDeferredActorSpawnFromClass") == 0) {
-            g_fnBeginDeferredActorSpawn = obj;
-            Log("[GTA_Prop_Fix]   Found BeginDeferredActorSpawnFromClass at 0x%p\n", obj);
-        } else if (!g_fnFinishSpawningActor && strcmp(nameBuf, "FinishSpawningActor") == 0) {
-            g_fnFinishSpawningActor = obj;
-            Log("[GTA_Prop_Fix]   Found FinishSpawningActor at 0x%p\n", obj);
-        } else if (!g_fnK2_DestroyActor && strcmp(nameBuf, "K2_DestroyActor") == 0) {
-            g_fnK2_DestroyActor = obj;
-            Log("[GTA_Prop_Fix]   Found K2_DestroyActor at 0x%p\n", obj);
-        } else if (!g_classStaticMeshActor && strcmp(nameBuf, "StaticMeshActor") == 0) {
-            void* uclass = *(void**)((uintptr_t)obj + 0x10);
-            if (uclass) {
-                char clsName[64];
-                if (GetFNameString(*(int32_t*)((uintptr_t)uclass + 0x18), clsName, sizeof(clsName))) {
-                    if (strcmp(clsName, "Class") == 0) {
-                        g_classStaticMeshActor = obj;
-                        Log("[GTA_Prop_Fix]   Found UClass StaticMeshActor at 0x%p\n", obj);
-                    }
-                }
-            }
         } else if (!g_meshBreakableFloor && strcmp(nameBuf, "Breakable_Floor") == 0) {
             void* uclass = *(void**)((uintptr_t)obj + 0x10);
             if (uclass) {
@@ -359,7 +256,7 @@ static void ResolveEngineFunctions() {
         }
     }
 
-    if (g_fnSetMobility && g_fnSetWorldLocationAndRotation && g_fnSetCollisionObjectType) {
+    if (g_fnSetMobility && g_fnSetWorldLocationAndRotation && g_fnSetCollisionObjectType && g_fnGetComponentLocation) {
         g_bFunctionsResolved = true;
         Log("[GTA_Prop_Fix] Engine functions successfully resolved!\n");
     }
@@ -373,10 +270,9 @@ static void SetChannelResponse(void* comp, uint8_t channel, uint8_t response) {
 }
 
 // ===== Component Resolver =====
-static void ResolveComponents(void* Context, void** outFloor, void** outBrokenMesh, void** outMesh) {
+static void ResolveComponents(void* Context, void** outFloor, void** outBrokenMesh) {
     *outFloor = nullptr;
     *outBrokenMesh = nullptr;
-    *outMesh = nullptr;
     if (!Context || !g_Objects) return;
 
     for (int32_t i = 0; i < g_Objects->NumElements; ++i) {
@@ -407,141 +303,71 @@ static void ResolveComponents(void* Context, void** outFloor, void** outBrokenMe
             if (!*outBrokenMesh && (strstr(objName, "Broken") != nullptr || strstr(clsName, "SkeletalMeshComponent") != nullptr)) {
                 *outBrokenMesh = obj;
             }
-
-            if (!*outMesh && strcmp(objName, "Mesh") == 0 && strstr(clsName, "StaticMeshComponent") != nullptr) {
-                *outMesh = obj;
-            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 }
 
-// ===== Standalone Vehicle PhysX Collider Spawner =====
-static void SpawnStandaloneVehicleCollider(void* Context, float contactX, float contactY, float contactZ, float vx, float vy, float speed) {
-    if (!Context || !g_fnBeginDeferredActorSpawn || !g_fnFinishSpawningActor) return;
+// ===== Nearby Map Objects & Vehicles PhysX Activator =====
+static void ActivateNearbyCollision(float centerX, float centerY, float centerZ, float radiusCm) {
+    if (!g_Objects || !g_fnGetComponentLocation || !g_fnSetCollisionEnabled || !pOriginalProcessEvent) return;
 
-    void* actorClass = g_classStaticMeshActor;
-    if (!actorClass) actorClass = *(void**)((uintptr_t)Context + 0x10); // Fallback: Breakable Actor class
-    if (!actorClass) return;
+    float r2 = radiusCm * radiusCm;
+    int activatedCount = 0;
 
-    float dirX = 0.0f;
-    float dirY = 0.0f;
-    float yawDeg = 0.0f;
-    if (speed > 50.0f) {
-        dirX = vx / speed;
-        dirY = vy / speed;
-        yawDeg = atan2f(dirY, dirX) * 57.2957795f;
+    for (int32_t i = 0; i < g_Objects->NumElements; ++i) {
+        int32_t chunkIdx = i / 65536;
+        int32_t inChunk  = i % 65536;
+        if (chunkIdx >= g_Objects->NumChunks || !g_Objects->Objects[chunkIdx]) continue;
+        FUObjectItem* item = &g_Objects->Objects[chunkIdx][inChunk];
+        if (!item || !item->Object) continue;
+        void* obj = item->Object;
+
+        __try {
+            void* uclass = *(void**)((uintptr_t)obj + 0x10);
+            if (!uclass) continue;
+
+            char clsName[64] = "";
+            GetFNameString(*(int32_t*)((uintptr_t)uclass + 0x18), clsName, sizeof(clsName));
+
+            // Target PrimitiveComponents (StaticMeshComponent, BoxComponent, etc.)
+            if (strstr(clsName, "StaticMeshComponent") == nullptr &&
+                strstr(clsName, "PrimitiveComponent") == nullptr) continue;
+
+            // Query component location
+            Parms_GetComponentLocation locParms{};
+            pOriginalProcessEvent(obj, g_fnGetComponentLocation, &locParms);
+
+            float dx = locParms.ReturnValue[0] - centerX;
+            float dy = locParms.ReturnValue[1] - centerY;
+            float dz = locParms.ReturnValue[2] - centerZ;
+            float distSq = dx * dx + dy * dy + dz * dz;
+
+            if (distSq > r2 || distSq < 1.0f) continue; // Out of radius or self
+
+            char objName[64] = "";
+            GetFNameString(*(int32_t*)((uintptr_t)obj + 0x18), objName, sizeof(objName));
+
+            // Skip broken mesh or floor
+            if (strstr(objName, "Broken") != nullptr || strstr(objName, "Floor") != nullptr) continue;
+
+            // Enable QueryAndPhysics (3)
+            Parms_SetCollisionEnabled colParms = { 3 };
+            pOriginalProcessEvent(obj, g_fnSetCollisionEnabled, &colParms);
+
+            // Block PhysicsBody (5) and Destructible (7)
+            SetChannelResponse(obj, 5, 2); // ECC_PhysicsBody -> ECR_Block
+            SetChannelResponse(obj, 7, 2); // ECC_Destructible -> ECR_Block
+
+            activatedCount++;
+            if (activatedCount <= 15) {
+                Log("[GTA_Prop_Fix] Activated PhysX on '%s' (Class '%s') at (%.1f, %.1f, %.1f), dist=%.1fm\n",
+                    objName, clsName, locParms.ReturnValue[0], locParms.ReturnValue[1], locParms.ReturnValue[2],
+                    sqrtf(distSq) / 100.0f);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // Vehicle center is ~2.0m behind front bumper impact
-    float carX = contactX - dirX * 200.0f;
-    float carY = contactY - dirY * 200.0f;
-    float carZ = contactZ + 70.0f; // Half-height = 70cm, bottom at road, top at 140cm
-
-    Parms_BeginDeferredActorSpawnFromClass beginParms{};
-    beginParms.WorldContextObject = Context;
-    beginParms.ActorClass = actorClass;
-    beginParms.SpawnTransform_Rot[0] = 0.0f;
-    beginParms.SpawnTransform_Rot[1] = 0.0f;
-    beginParms.SpawnTransform_Rot[2] = 0.0f;
-    beginParms.SpawnTransform_Rot[3] = 1.0f;
-    beginParms.SpawnTransform_Trans[0] = carX;
-    beginParms.SpawnTransform_Trans[1] = carY;
-    beginParms.SpawnTransform_Trans[2] = carZ;
-    beginParms.SpawnTransform_Scale[0] = 1.0f;
-    beginParms.SpawnTransform_Scale[1] = 1.0f;
-    beginParms.SpawnTransform_Scale[2] = 1.0f;
-    beginParms.CollisionHandlingOverride = 1; // AlwaysSpawn
-    beginParms.Owner = nullptr;               // STANDALONE INDEPENDENT ACTOR!
-
-    pOriginalProcessEvent(Context, g_fnBeginDeferredActorSpawn, &beginParms);
-    void* newActor = beginParms.ReturnValue;
-    if (!newActor) {
-        Log("[GTA_Prop_Fix] BeginDeferredActorSpawnFromClass returned null!\n");
-        return;
-    }
-
-    Parms_FinishSpawningActor finishParms{};
-    finishParms.Actor = newActor;
-    finishParms.SpawnTransform_Rot[0] = 0.0f;
-    finishParms.SpawnTransform_Rot[1] = 0.0f;
-    finishParms.SpawnTransform_Rot[2] = 0.0f;
-    finishParms.SpawnTransform_Rot[3] = 1.0f;
-    finishParms.SpawnTransform_Trans[0] = carX;
-    finishParms.SpawnTransform_Trans[1] = carY;
-    finishParms.SpawnTransform_Trans[2] = carZ;
-    finishParms.SpawnTransform_Scale[0] = 1.0f;
-    finishParms.SpawnTransform_Scale[1] = 1.0f;
-    finishParms.SpawnTransform_Scale[2] = 1.0f;
-    pOriginalProcessEvent(Context, g_fnFinishSpawningActor, &finishParms);
-
-    Log("[GTA_Prop_Fix] Spawned Standalone Vehicle Actor at 0x%p, Pos=(%.2f, %.2f, %.2f)!\n",
-        newActor, carX, carY, carZ);
-
-    // Resolve component on new actor
-    void* newFloor = nullptr;
-    void* newBroken = nullptr;
-    void* newMesh = nullptr;
-    ResolveComponents(newActor, &newFloor, &newBroken, &newMesh);
-
-    void* targetComp = newFloor ? newFloor : (newMesh ? newMesh : nullptr);
-    if (!targetComp) {
-        targetComp = *(void**)((uintptr_t)newActor + 0x0130); // AActor::RootComponent
-    }
-
-    if (targetComp) {
-        if (g_meshBreakableFloor && g_fnSetStaticMesh) {
-            Parms_SetStaticMesh meshParms = { g_meshBreakableFloor, false };
-            pOriginalProcessEvent(targetComp, g_fnSetStaticMesh, &meshParms);
-        }
-        if (g_fnSetMobility) {
-            Parms_SetMobility mob = { 2 }; // Movable
-            pOriginalProcessEvent(targetComp, g_fnSetMobility, &mob);
-        }
-        if (g_fnSetWorldScale3D) {
-            Parms_SetWorldScale3D scale{};
-            scale.NewScale[0] = 2.2f;
-            scale.NewScale[1] = 4.8f;
-            scale.NewScale[2] = 1.4f;
-            pOriginalProcessEvent(targetComp, g_fnSetWorldScale3D, &scale);
-        }
-        if (g_fnSetCollisionObjectType) {
-            Parms_SetCollisionObjectType type = { 1 }; // ECC_WorldDynamic
-            pOriginalProcessEvent(targetComp, g_fnSetCollisionObjectType, &type);
-        }
-        if (g_fnSetCollisionEnabled) {
-            Parms_SetCollisionEnabled col = { 3 }; // QueryAndPhysics
-            pOriginalProcessEvent(targetComp, g_fnSetCollisionEnabled, &col);
-        }
-        if (g_fnSetCollisionResponseToAllChannels) {
-            Parms_SetCollisionResponseToAllChannels resp = { 0 }; // ECR_Ignore
-            pOriginalProcessEvent(targetComp, g_fnSetCollisionResponseToAllChannels, &resp);
-        }
-        SetChannelResponse(targetComp, 5, 2); // ECC_PhysicsBody -> ECR_Block
-        SetChannelResponse(targetComp, 7, 2); // ECC_Destructible -> ECR_Block
-
-        Log("[GTA_Prop_Fix] Configured Vehicle Box Component at 0x%p (Scale: 2.2 x 4.8 x 1.4)!\n", targetComp);
-    }
-
-    // Register active vehicle actor
-    for (int i = 0; i < MAX_VEHICLE_ACTORS; ++i) {
-        if (!g_VehicleActors[i].Active) {
-            g_VehicleActors[i].Actor = newActor;
-            g_VehicleActors[i].TargetComp = targetComp;
-            g_VehicleActors[i].PosX = carX;
-            g_VehicleActors[i].PosY = carY;
-            g_VehicleActors[i].PosZ = carZ;
-            g_VehicleActors[i].VelX = vx;
-            g_VehicleActors[i].VelY = vy;
-            g_VehicleActors[i].Yaw = yawDeg;
-            DWORD now = GetTickCount();
-            g_VehicleActors[i].StartTime = now;
-            g_VehicleActors[i].LastUpdateTime = now;
-            g_VehicleActors[i].DurationSec = 2.5f;
-            g_VehicleActors[i].Active = true;
-            Log("[GTA_Prop_Fix] Standalone Vehicle Actor registered for tracking (Slot %d, 2.5s).\n", i);
-            return;
-        }
-    }
+    Log("[GTA_Prop_Fix] Total nearby map/traffic objects activated for PhysX: %d\n", activatedCount);
 }
 
 // ===== Core Physics Fix on SetupBroken =====
@@ -550,7 +376,6 @@ static void FixBrokenProp(void* Context, void* Parms) {
 
     __try {
         float* pImpulseSrc = (float*)((uintptr_t)Parms + 0x00);
-        float* pImpulseVel = (float*)((uintptr_t)Parms + 0x0C);
         float* pFloorLoc   = (float*)((uintptr_t)Parms + 0x30);
 
         float contactX = pFloorLoc[0];
@@ -564,18 +389,11 @@ static void FixBrokenProp(void* Context, void* Parms) {
             contactZ = pImpulseSrc[2] - 80.0f;
         }
 
-        float vx = pImpulseVel[0];
-        float vy = pImpulseVel[1];
-        float vz = pImpulseVel[2];
-        float speed = sqrtf(vx * vx + vy * vy);
-
-        Log("[GTA_Prop_Fix] Impact: Contact=(%.2f, %.2f, %.2f), Speed=%.1f km/h\n",
-            contactX, contactY, contactZ, speed * 0.036f);
+        Log("[GTA_Prop_Fix] Impact Contact Point: (%.2f, %.2f, %.2f)\n", contactX, contactY, contactZ);
 
         void* floorComp = nullptr;
         void* brokenMeshComp = nullptr;
-        void* meshComp = nullptr;
-        ResolveComponents(Context, &floorComp, &brokenMeshComp, &meshComp);
+        ResolveComponents(Context, &floorComp, &brokenMeshComp);
 
         // 1. Configure & Teleport the Flush Ground Floor Collider
         if (floorComp) {
@@ -680,10 +498,8 @@ static void FixBrokenProp(void* Context, void* Parms) {
             *(uint8_t*)((uintptr_t)brokenMeshComp + 0x02C0 + 0x0059) = 1; // Sensitive Sleep Family
         }
 
-        // 3. Spawn Standalone Vehicle PhysX Collider
-        if (speed > 50.0f) {
-            SpawnStandaloneVehicleCollider(Context, contactX, contactY, contactZ, vx, vy, speed);
-        }
+        // 3. Activate PhysX collision on all nearby houses, footpaths, walls & traffic cars!
+        ActivateNearbyCollision(contactX, contactY, contactZ, 3500.0f);
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[GTA_Prop_Fix] Exception in FixBrokenProp!\n");
@@ -696,9 +512,6 @@ static void Hooked_ProcessEvent(void* Context, void* Function, void* Parms) {
         pOriginalProcessEvent(Context, Function, Parms);
         return;
     }
-
-    // Advance standalone vehicle kinematic actors on the game thread
-    UpdateActiveVehicleActors();
 
     int32_t funcNameIdx = *(int32_t*)((uintptr_t)Function + 0x18);
 
@@ -797,7 +610,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         fopen_s(&g_LogFile, logPath, "w");
 
         Log("============================================================\n");
-        Log("GTA SA Definitive Edition - Street Props Ground & Vehicle Fix v0.0.2\n");
+        Log("GTA SA Definitive Edition - Street Props & World Collision Fix v0.0.3\n");
         Log("============================================================\n");
 
         uintptr_t imageBase = (uintptr_t)GetModuleHandleA(NULL);
@@ -824,7 +637,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         }
 
         Log("[GTA_Prop_Fix] Hook successfully installed on UObject::ProcessEvent!\n");
-        Log("[GTA_Prop_Fix] Ready: Flush ground barrier and standalone vehicle collider active.\n");
+        Log("[GTA_Prop_Fix] Ready: Flush ground barrier and nearby map PhysX activator active.\n");
 
         CreateThread(NULL, 0, PhysicsInitThread, NULL, 0, NULL);
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
