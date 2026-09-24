@@ -1,6 +1,6 @@
 # GTA_Prop_Fix (v0.0.1)
 
-A lightweight x64 ASI plugin for **Grand Theft Auto: The Trilogy – The Definitive Edition** (specifically targeting *GTA: San Andreas – The Definitive Edition*) that fixes broken streetlights, traffic poles, fences, and dynamic street props from falling through the road and vanishing into the void.
+A lightweight x64 ASI plugin for **Grand Theft Auto: The Trilogy – The Definitive Edition** (specifically targeting *GTA: San Andreas – The Definitive Edition*) that prevents broken streetlights, traffic poles, fences, and dynamic street props from falling through the world/road geometry into the void.
 
 ---
 
@@ -11,22 +11,24 @@ In the Definitive Edition, Grove Street Games used a hybrid engine architecture:
 2. **Unreal Engine 4:** Runs purely as a graphics renderer.
 
 When a streetlight or fence breaks, the game hands the fractured mesh (`BrokenMesh`) over to **Unreal Engine 4 PhysX** rigid-body simulation. However:
-- **PhysX runs in an empty void:** Unreal Engine has no PhysX collision geometry for the city roads or terrain.
-- **Falling Through Ground:** Because there is no terrain collision in PhysX, broken props fell straight through the road and vanished into the void.
-- Grove Street Games attempted a crude workaround (`PhysicsFloor`), but despawned it after a few seconds (`RemoveFloor`), causing resting props to drop through the world and disappear forever.
+- **PhysX runs in an empty void:** Unreal Engine has no PhysX collision meshes for the city roads, terrain, or buildings (those belong exclusively to the RenderWare engine).
+- **Falling Through Ground:** Because there is no terrain collision in PhysX, broken props fell straight through the road and vanished into the void. Grove Street Games attempted a crude workaround (`PhysicsFloor`), but despawned it after a few seconds (`RemoveFloor`), causing resting props to immediately drop through the pavement into the void.
 
 ---
 
 ## Features
 
 ### 1. Zero-Penetration Ground Barrier (No Falling Through the World)
-- **Blocked Floor Removal:** Intercepts and permanently blocks `RemoveFloor` calls, ensuring the solid ground collision is never deleted.
-- **Flush Road Barrier:** Dynamically scales and positions a $150\text{m} \times 150\text{m} \times 0.2\text{m}$ solid ground barrier centered at `contactZ - 10.0 cm`, keeping its top face perfectly flush with the road surface.
-- **Detached Collision:** Detaches the floor component from the actor (`KeepWorld`) to break PhysX same-actor collision suppression.
-- Broken poles, traffic lights, and fences now solidly collide and rest on the pavement without falling through the map.
+- **Blocks `RemoveFloor`:** Permanently prevents the game from destroying the ground collision barrier under broken props.
+- **Dynamic Flush Road Collider:** Intercepts `SetupBroken` and transforms `PhysicsFloor` into a massive $150\text{m} \times 150\text{m} \times 0.2\text{m}$ solid `WorldStatic` barrier positioned flush with the road surface at `contactZ`.
+- **Decoupled Ownership:** Detaches `PhysicsFloor` from the actor (`KeepWorld`) to break PhysX same-actor collision suppression, ensuring broken debris reliably collides with the ground.
+- **Continuous Collision Detection (CCD):** Enables CCD and sets sensitive sleep properties on broken meshes so resting debris settles solidly on the pavement.
 
 ### 2. Engine PhysX Substepping
-- Enables substepping on `Default__PhysicsSettingsCore` at runtime (`MaxSubsteps = 4`, `MaxDelta = 0.0167s`), eliminating collision tunneling during impacts.
+- Enables substepping on `PhysicsSettingsCore` at runtime (`MaxSubsteps = 4`, `MaxDelta = 0.0167s`), stabilizing high-speed physics solver calculations.
+
+### 3. Pure Release Build
+- Zero logging and zero file I/O overhead for maximum performance and clean gameplay.
 
 ---
 
@@ -38,7 +40,7 @@ When a streetlight or fence breaks, the game hands the fractured mesh (`BrokenMe
    ```text
    <GameRoot>\Gameface\Binaries\Win64\
    ```
-4. Launch the game. A log file named `GTA_Prop_Fix.log` will be generated in the same directory to confirm initialization.
+4. Launch the game. Broken street props will now solidly rest on the pavement without falling through the road.
 
 ---
 

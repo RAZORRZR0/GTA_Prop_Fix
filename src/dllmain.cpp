@@ -1,45 +1,27 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include "../minhook/MinHook.h"
 
 // =======================================================================
-// GTA SA Definitive Edition - Street Props Ground Physics Fix v0.0.1
+// GTA SA Definitive Edition - Street Props Ground Collision Fix v0.0.1
 //
-// Core Solution:
-// 1. FLUSH GROUND COLLIDER (PREVENTS PROPS FROM FALLING THROUGH THE ROAD):
-//    - Repositions the prop's 'PhysicsFloor' directly under the contact point,
-//      making its top face flush with the road (contactZ).
-//    - Expands it to a 150m x 150m solid ground barrier (QueryAndPhysics).
-//    - Detaches from actor to break PhysX same-actor collision suppression.
-// 2. PERMANENTLY PRESERVE GROUND COLLISION:
-//    - Intercepts and blocks all calls to 'RemoveFloor', keeping broken props
-//      from falling into the void when the base game tries to delete the floor.
-// 3. PHYSX SUBSTEPPING:
-//    - Enables substepping on UPhysicsSettings at runtime to eliminate tunneling.
+// Core Fix:
+// 1. Permanently blocks RemoveFloor calls from despawning the ground collider.
+// 2. Intercepts SetupBroken and transforms PhysicsFloor into a massive
+//    150m x 150m x 0.2m solid WorldStatic ground barrier positioned
+//    flush with the road surface at contactZ.
+// 3. Detaches PhysicsFloor from the actor to break PhysX same-actor
+//    collision suppression.
+// 4. Enables Continuous Collision Detection (CCD) and PhysX substepping.
 // =======================================================================
 
 // RVAs for SanAndreas.exe
 static const uintptr_t RVA_ProcessEvent = 0x01C7B6B0;
 static const uintptr_t RVA_GNames       = 0x0570CDC0;
 static const uintptr_t RVA_GObjects      = 0x05086380;
-
-static FILE* g_LogFile = nullptr;
-
-static void Log(const char* fmt, ...) {
-    if (!g_LogFile) return;
-    va_list args;
-    va_start(args, fmt);
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_LogFile, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    vfprintf(g_LogFile, fmt, args);
-    fflush(g_LogFile);
-    va_end(args);
-}
 
 // ===== UE4 Structures =====
 #pragma pack(push, 1)
@@ -106,8 +88,6 @@ static ProcessEvent_Fn pOriginalProcessEvent = nullptr;
 
 static int32_t s_RemoveFloorIdx = -1;
 static int32_t s_SetupBrokenIdx = -1;
-static uint64_t s_BlockedRemoveFloorCount = 0;
-static uint64_t s_PatchedSetupBrokenCount = 0;
 
 // ===== Engine UFunction Pointers =====
 static void* g_fnSetMobility = nullptr;                     // USceneComponent::SetMobility
@@ -129,54 +109,54 @@ static volatile bool g_bFunctionsResolved = false;
 // ===== Parameter Structs =====
 #pragma pack(push, 1)
 struct Parms_SetMobility {
-    uint8_t NewMobility; // 0x0000(0x0001) 2 = Movable
+    uint8_t NewMobility; // 2 = Movable
 };
 struct Parms_K2_DetachFromComponent {
-    uint8_t LocationRule; // 0x0000(0x0001) 1 = KeepWorld
-    uint8_t RotationRule; // 0x0001(0x0001) 1 = KeepWorld
-    uint8_t ScaleRule;    // 0x0002(0x0001) 1 = KeepWorld
-    bool bCallModify;     // 0x0003(0x0001)
+    uint8_t LocationRule; // 1 = KeepWorld
+    uint8_t RotationRule; // 1 = KeepWorld
+    uint8_t ScaleRule;    // 1 = KeepWorld
+    bool bCallModify;
 };
 struct Parms_SetAbsolute {
-    bool bNewAbsoluteLocation; // 0x0000(0x0001)
-    bool bNewAbsoluteRotation; // 0x0001(0x0001)
-    bool bNewAbsoluteScale;    // 0x0002(0x0001)
+    bool bNewAbsoluteLocation;
+    bool bNewAbsoluteRotation;
+    bool bNewAbsoluteScale;
 };
 struct Parms_SetWorldLocationAndRotation {
-    float NewLocation[3];          // 0x0000(0x000C)
-    float NewRotation[3];          // 0x000C(0x000C)
-    bool bSweep;                   // 0x0018(0x0001)
+    float NewLocation[3];
+    float NewRotation[3];
+    bool bSweep;
     uint8_t Pad_19[3];
-    uint8_t SweepHitResult[0x8C];  // 0x001C(0x008C)
-    bool bTeleport;                // 0x00A8(0x0001)
+    uint8_t SweepHitResult[0x8C];
+    bool bTeleport;
     uint8_t Pad_A9[3];
 };
 struct Parms_SetWorldScale3D {
-    float NewScale[3]; // 0x0000(0x000C)
+    float NewScale[3];
 };
 struct Parms_SetCollisionObjectType {
-    uint8_t Channel; // 0x0000(0x0001) 0 = ECC_WorldStatic
+    uint8_t Channel; // 0 = ECC_WorldStatic
 };
 struct Parms_SetCollisionEnabled {
-    uint8_t NewType; // 0x0000(0x0001) 3 = QueryAndPhysics
+    uint8_t NewType; // 3 = QueryAndPhysics
 };
 struct Parms_SetCollisionResponseToAllChannels {
-    uint8_t NewResponse; // 0x0000(0x0001) 2 = ECR_Block
+    uint8_t NewResponse; // 2 = ECR_Block
 };
 struct Parms_SetCollisionResponseToChannel {
-    uint8_t Channel;     // 0x0000(0x0001)
-    uint8_t NewResponse; // 0x0001(0x0001)
+    uint8_t Channel;
+    uint8_t NewResponse;
 };
 struct Parms_IgnoreComponentWhenMoving {
-    void* Component; // 0x0000(0x0008)
-    bool bShouldIgnore; // 0x0008(0x0001)
+    void* Component;
+    bool bShouldIgnore;
 };
 struct Parms_SetAllUseCCD {
-    bool InUseCCD; // 0x0000(0x0001)
+    bool InUseCCD;
 };
 struct Parms_SetStaticMesh {
-    void* NewMesh; // 0x0000(0x0008)
-    bool ReturnValue; // 0x0008(0x0001)
+    void* NewMesh;
+    bool ReturnValue;
 };
 #pragma pack(pop)
 
@@ -198,43 +178,30 @@ static void ResolveEngineFunctions() {
 
         if (!g_fnSetMobility && strcmp(nameBuf, "SetMobility") == 0) {
             g_fnSetMobility = obj;
-            Log("[LightPoleFix]   Found SetMobility at 0x%p\n", obj);
         } else if (!g_fnK2_DetachFromComponent && strcmp(nameBuf, "K2_DetachFromComponent") == 0) {
             g_fnK2_DetachFromComponent = obj;
-            Log("[LightPoleFix]   Found K2_DetachFromComponent at 0x%p\n", obj);
         } else if (!g_fnSetAbsolute && strcmp(nameBuf, "SetAbsolute") == 0) {
             g_fnSetAbsolute = obj;
-            Log("[LightPoleFix]   Found SetAbsolute at 0x%p\n", obj);
         } else if (!g_fnSetWorldLocationAndRotation && strcmp(nameBuf, "K2_SetWorldLocationAndRotation") == 0) {
             g_fnSetWorldLocationAndRotation = obj;
-            Log("[LightPoleFix]   Found K2_SetWorldLocationAndRotation at 0x%p\n", obj);
         } else if (!g_fnSetWorldScale3D && strcmp(nameBuf, "SetWorldScale3D") == 0) {
             g_fnSetWorldScale3D = obj;
-            Log("[LightPoleFix]   Found SetWorldScale3D at 0x%p\n", obj);
         } else if (!g_fnSetCollisionObjectType && strcmp(nameBuf, "SetCollisionObjectType") == 0) {
             g_fnSetCollisionObjectType = obj;
-            Log("[LightPoleFix]   Found SetCollisionObjectType at 0x%p\n", obj);
         } else if (!g_fnSetCollisionEnabled && strcmp(nameBuf, "SetCollisionEnabled") == 0) {
             g_fnSetCollisionEnabled = obj;
-            Log("[LightPoleFix]   Found SetCollisionEnabled at 0x%p\n", obj);
         } else if (!g_fnSetCollisionResponseToAllChannels && strcmp(nameBuf, "SetCollisionResponseToAllChannels") == 0) {
             g_fnSetCollisionResponseToAllChannels = obj;
-            Log("[LightPoleFix]   Found SetCollisionResponseToAllChannels at 0x%p\n", obj);
         } else if (!g_fnSetCollisionResponseToChannel && strcmp(nameBuf, "SetCollisionResponseToChannel") == 0) {
             g_fnSetCollisionResponseToChannel = obj;
-            Log("[LightPoleFix]   Found SetCollisionResponseToChannel at 0x%p\n", obj);
         } else if (!g_fnIgnoreComponentWhenMoving && strcmp(nameBuf, "IgnoreComponentWhenMoving") == 0) {
             g_fnIgnoreComponentWhenMoving = obj;
-            Log("[LightPoleFix]   Found IgnoreComponentWhenMoving at 0x%p\n", obj);
         } else if (!g_fnClearMoveIgnoreComponents && strcmp(nameBuf, "ClearMoveIgnoreComponents") == 0) {
             g_fnClearMoveIgnoreComponents = obj;
-            Log("[LightPoleFix]   Found ClearMoveIgnoreComponents at 0x%p\n", obj);
         } else if (!g_fnSetAllUseCCD && strcmp(nameBuf, "SetAllUseCCD") == 0) {
             g_fnSetAllUseCCD = obj;
-            Log("[LightPoleFix]   Found SetAllUseCCD at 0x%p\n", obj);
         } else if (!g_fnSetStaticMesh && strcmp(nameBuf, "SetStaticMesh") == 0) {
             g_fnSetStaticMesh = obj;
-            Log("[LightPoleFix]   Found SetStaticMesh at 0x%p\n", obj);
         } else if (!g_meshBreakableFloor && strcmp(nameBuf, "Breakable_Floor") == 0) {
             void* uclass = *(void**)((uintptr_t)obj + 0x10);
             if (uclass) {
@@ -242,7 +209,6 @@ static void ResolveEngineFunctions() {
                 if (GetFNameString(*(int32_t*)((uintptr_t)uclass + 0x18), clsName, sizeof(clsName))) {
                     if (strcmp(clsName, "StaticMesh") == 0) {
                         g_meshBreakableFloor = obj;
-                        Log("[LightPoleFix]   Found StaticMesh Breakable_Floor at 0x%p\n", obj);
                     }
                 }
             }
@@ -251,7 +217,6 @@ static void ResolveEngineFunctions() {
 
     if (g_fnSetMobility && g_fnSetWorldLocationAndRotation && g_fnSetCollisionObjectType) {
         g_bFunctionsResolved = true;
-        Log("[LightPoleFix] All engine physics functions successfully resolved!\n");
     }
 }
 
@@ -289,8 +254,6 @@ static void ResolveComponents(void* Context, void** outFloor, void** outBrokenMe
 
             if (strstr(clsName, "Component") == nullptr) continue;
 
-            Log("  [Actor Component] '%s' (Class '%s') at 0x%p\n", objName, clsName, obj);
-
             if (!*outFloor && (strcmp(objName, "PhysicsFloor") == 0 || strstr(objName, "Floor") != nullptr)) {
                 *outFloor = obj;
             }
@@ -302,18 +265,11 @@ static void ResolveComponents(void* Context, void** outFloor, void** outBrokenMe
     }
 }
 
-// ===== Core Ground Physics Fix on SetupBroken =====
+// ===== Core Physics Fix on SetupBroken =====
 static void FixBrokenProp(void* Context, void* Parms) {
     if (!Context || !Parms) return;
 
     __try {
-        char actorName[128] = "Unknown";
-        char actorClassName[128] = "Unknown";
-        GetFNameString(*(int32_t*)((uintptr_t)Context + 0x18), actorName, sizeof(actorName));
-        void* actorClass = *(void**)((uintptr_t)Context + 0x10);
-        if (actorClass) GetFNameString(*(int32_t*)((uintptr_t)actorClass + 0x18), actorClassName, sizeof(actorClassName));
-        Log("[LightPoleFix] Broken Prop Actor: '%s' (Class '%s') at 0x%p\n", actorName, actorClassName, Context);
-
         float* pImpulseSrc = (float*)((uintptr_t)Parms + 0x00);
         float* pFloorLoc   = (float*)((uintptr_t)Parms + 0x30);
 
@@ -328,24 +284,16 @@ static void FixBrokenProp(void* Context, void* Parms) {
             contactZ = pImpulseSrc[2] - 80.0f;
         }
 
-        Log("[LightPoleFix] Target Ground Contact: (%.2f, %.2f, %.2f)\n", contactX, contactY, contactZ);
-
         void* floorComp = nullptr;
         void* brokenMeshComp = nullptr;
         ResolveComponents(Context, &floorComp, &brokenMeshComp);
 
-        Log("[LightPoleFix]   floorComp   = 0x%p\n", floorComp);
-        Log("[LightPoleFix]   brokenMesh  = 0x%p\n", brokenMeshComp);
-
-        // ==============================================================
-        // CONFIGURE & TELEPORT THE GROUND FLOOR COLLIDER
-        // ==============================================================
+        // Configure & Teleport the Ground Floor Collider
         if (floorComp) {
             void* curMesh = *(void**)((uintptr_t)floorComp + 0x0480);
             if (!curMesh && g_meshBreakableFloor && g_fnSetStaticMesh) {
                 Parms_SetStaticMesh meshParms = { g_meshBreakableFloor, false };
                 pOriginalProcessEvent(floorComp, g_fnSetStaticMesh, &meshParms);
-                Log("[LightPoleFix]   Assigned Breakable_Floor StaticMesh to PhysicsFloor!\n");
             }
 
             if (g_fnSetMobility) {
@@ -375,7 +323,6 @@ static void FixBrokenProp(void* Context, void* Parms) {
                 locRotParms.bSweep = false;
                 locRotParms.bTeleport = true;
                 pOriginalProcessEvent(floorComp, g_fnSetWorldLocationAndRotation, &locRotParms);
-                Log("[LightPoleFix]   -> Teleported Floor (Top Surface Flush at Z=%.2f)!\n", contactZ);
             }
 
             // Expand to 150m x 150m x 0.2m ground barrier
@@ -385,7 +332,6 @@ static void FixBrokenProp(void* Context, void* Parms) {
                 scaleParms.NewScale[1] = 150.0f;
                 scaleParms.NewScale[2] = 0.2f;
                 pOriginalProcessEvent(floorComp, g_fnSetWorldScale3D, &scaleParms);
-                Log("[LightPoleFix]   -> SetWorldScale3D(150, 150, 0.2) SUCCESS!\n");
             }
 
             if (g_fnSetCollisionObjectType) {
@@ -421,9 +367,7 @@ static void FixBrokenProp(void* Context, void* Parms) {
             *(float*)((uintptr_t)floorComp + 0x02C0 + 0x00A8) = 100.0f; // MaxDepenetrationVelocity = 1.0 m/s
         }
 
-        // ==============================================================
-        // CONFIGURE BROKEN MESH
-        // ==============================================================
+        // Configure BrokenMesh
         if (brokenMeshComp) {
             if (g_fnSetCollisionEnabled) {
                 Parms_SetCollisionEnabled colParms = { 3 }; // QueryAndPhysics
@@ -447,15 +391,11 @@ static void FixBrokenProp(void* Context, void* Parms) {
             // Cap depenetration velocity to prevent violent launches
             *(float*)((uintptr_t)brokenMeshComp + 0x02C0 + 0x00A8) = 150.0f;
 
-            // Enable Sensitive Sleep Family so resting debris comes to a clean stop on the ground
+            // Enable Sensitive Sleep Family
             *(uint8_t*)((uintptr_t)brokenMeshComp + 0x02C0 + 0x0059) = 1;
-
-            Log("[LightPoleFix]   -> Ground collision active on BrokenMesh!\n");
         }
 
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[LightPoleFix] Exception in FixBrokenProp!\n");
-    }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // ===== ProcessEvent Hook =====
@@ -467,47 +407,29 @@ static void Hooked_ProcessEvent(void* Context, void* Function, void* Parms) {
 
     int32_t funcNameIdx = *(int32_t*)((uintptr_t)Function + 0x18);
 
-    // 1. Block RemoveFloor calls permanently (preserves ground collision)
+    // Block RemoveFloor calls permanently
     if (funcNameIdx == s_RemoveFloorIdx && s_RemoveFloorIdx != -1) {
-        s_BlockedRemoveFloorCount++;
-        if (s_BlockedRemoveFloorCount <= 5 || (s_BlockedRemoveFloorCount % 20 == 0)) {
-            Log("[LightPoleFix] Blocked RemoveFloor #%llu! Floor collision preserved.\n", s_BlockedRemoveFloorCount);
-        }
         return;
     }
 
-    // 2. Discover FName indices
+    // Discover FName indices
     if (s_RemoveFloorIdx == -1 || s_SetupBrokenIdx == -1) {
         char nameBuf[256];
         if (GetFNameString(funcNameIdx, nameBuf, sizeof(nameBuf))) {
             if (strcmp(nameBuf, "RemoveFloor") == 0) {
                 s_RemoveFloorIdx = funcNameIdx;
-                s_BlockedRemoveFloorCount++;
-                Log("[LightPoleFix] Discovered RemoveFloor (FName=%d). Blocked.\n", funcNameIdx);
                 return;
             } else if (strcmp(nameBuf, "SetupBroken") == 0) {
                 s_SetupBrokenIdx = funcNameIdx;
-                Log("[LightPoleFix] Discovered SetupBroken (FName=%d).\n", funcNameIdx);
             }
         }
     }
 
-    // 3. Intercept SetupBroken
+    // Intercept SetupBroken
     if (funcNameIdx == s_SetupBrokenIdx && s_SetupBrokenIdx != -1) {
-        s_PatchedSetupBrokenCount++;
-        Log("\n[LightPoleFix] >>> INTERCEPTED SetupBroken #%llu (Actor=0x%p, Func=0x%p) <<<\n",
-            s_PatchedSetupBrokenCount, Context, Function);
-
         ResolveEngineFunctions();
-
-        // Run original game logic
         pOriginalProcessEvent(Context, Function, Parms);
-
-        // Apply ground collision fix
         FixBrokenProp(Context, Parms);
-
-        Log("[LightPoleFix] <<< SetupBroken #%llu complete! Ground collision active. >>>\n\n",
-            s_PatchedSetupBrokenCount);
         return;
     }
 
@@ -517,8 +439,6 @@ static void Hooked_ProcessEvent(void* Context, void* Function, void* Parms) {
 
 // Background worker: Configure PhysX substepping
 static DWORD WINAPI PhysicsInitThread(LPVOID lpParam) {
-    Log("[LightPoleFix] Background worker started. Waiting for UPhysicsSettings in GObjects...\n");
-
     bool substeppingConfigured = false;
     for (int attempts = 0; attempts < 60 && !substeppingConfigured; ++attempts) {
         Sleep(1000);
@@ -548,7 +468,6 @@ static DWORD WINAPI PhysicsInitThread(LPVOID lpParam) {
                                     *(int32_t*)((uintptr_t)obj + 0x0040) = 4;      // MaxSubsteps = 4
                                     *(float*)((uintptr_t)obj + 0x0044)   = 0.0167f;// MaxSubstepDeltaTime = 1/60s
                                     substeppingConfigured = true;
-                                    Log("[LightPoleFix] Successfully enabled PhysX substepping in %s (MaxSubsteps=4, MaxDelta=0.0167)!\n", nameBuf);
                                     break;
                                 }
                             }
@@ -556,9 +475,7 @@ static DWORD WINAPI PhysicsInitThread(LPVOID lpParam) {
                     }
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("[LightPoleFix] Exception while scanning for UPhysicsSettings.\n");
-        }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     return 0;
@@ -569,54 +486,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
-        char logPath[MAX_PATH];
-        GetModuleFileNameA(hModule, logPath, MAX_PATH);
-        char* lastSlash = strrchr(logPath, '\\');
-        if (lastSlash) *(lastSlash + 1) = '\0';
-        strcat_s(logPath, "GTA_Prop_Fix.log");
-        fopen_s(&g_LogFile, logPath, "w");
-
-        Log("============================================================\n");
-        Log("GTA SA Definitive Edition - Street Props Ground Physics Fix v0.0.1\n");
-        Log("============================================================\n");
-
         uintptr_t imageBase = (uintptr_t)GetModuleHandleA(NULL);
-        Log("[LightPoleFix] Target ImageBase: 0x%p\n", (void*)imageBase);
-
         g_Names = (FNamePool*)(imageBase + RVA_GNames);
         g_Objects = (TUObjectArray*)(imageBase + RVA_GObjects);
-        Log("[LightPoleFix] GNames at 0x%p, GObjects at 0x%p\n", g_Names, g_Objects);
 
         uintptr_t targetProcessEvent = imageBase + RVA_ProcessEvent;
-        Log("[LightPoleFix] Target UObject::ProcessEvent: 0x%p\n", (void*)targetProcessEvent);
 
-        if (MH_Initialize() != MH_OK) {
-            Log("[LightPoleFix] ERROR: MH_Initialize failed!\n");
-            return TRUE;
-        }
-
-        if (MH_CreateHook((LPVOID)targetProcessEvent, (LPVOID)&Hooked_ProcessEvent, (LPVOID*)&pOriginalProcessEvent) != MH_OK) {
-            Log("[LightPoleFix] ERROR: MH_CreateHook failed!\n");
-            return TRUE;
-        }
-
-        if (MH_EnableHook((LPVOID)targetProcessEvent) != MH_OK) {
-            Log("[LightPoleFix] ERROR: MH_EnableHook failed!\n");
-            return TRUE;
-        }
-
-        Log("[LightPoleFix] Hook successfully installed on UObject::ProcessEvent!\n");
-        Log("[LightPoleFix] Ready: Flush ground collision and anti-tunneling active.\n");
+        if (MH_Initialize() != MH_OK) return TRUE;
+        if (MH_CreateHook((LPVOID)targetProcessEvent, (LPVOID)&Hooked_ProcessEvent, (LPVOID*)&pOriginalProcessEvent) != MH_OK) return TRUE;
+        if (MH_EnableHook((LPVOID)targetProcessEvent) != MH_OK) return TRUE;
 
         CreateThread(NULL, 0, PhysicsInitThread, NULL, 0, NULL);
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
-        if (g_LogFile) {
-            Log("[LightPoleFix] Plugin unloaded cleanly.\n");
-            fclose(g_LogFile);
-            g_LogFile = nullptr;
-        }
     }
     return TRUE;
 }
