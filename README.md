@@ -1,6 +1,6 @@
 # GTA_Prop_Fix (v0.0.1)
 
-A lightweight x64 ASI plugin for **Grand Theft Auto: The Trilogy – The Definitive Edition** (specifically targeting *GTA: San Andreas – The Definitive Edition*) that fixes broken streetlights, traffic poles, fences, and dynamic props from falling through the world, ghosting through vehicles, or exploding with chaotic propeller-like physics.
+A lightweight x64 ASI plugin for **Grand Theft Auto: The Trilogy – The Definitive Edition** (specifically targeting *GTA: San Andreas – The Definitive Edition*) that fixes broken streetlights, traffic poles, fences, and dynamic street props from falling through the road and vanishing into the void.
 
 ---
 
@@ -11,33 +11,22 @@ In the Definitive Edition, Grove Street Games used a hybrid engine architecture:
 2. **Unreal Engine 4:** Runs purely as a graphics renderer.
 
 When a streetlight or fence breaks, the game hands the fractured mesh (`BrokenMesh`) over to **Unreal Engine 4 PhysX** rigid-body simulation. However:
-- **PhysX runs in an empty void:** Unreal Engine has no PhysX collision meshes for the city roads, buildings, or vehicles.
-- **Falling Through Ground:** Because there is no terrain collision in PhysX, broken props fell straight through the road and vanished into the void. Grove Street Games attempted a crude workaround (`PhysicsFloor`), but despawned it after a few seconds (`RemoveFloor`), causing resting props to drop through the world.
-- **Ghosting Through Vehicles:** Because vehicles have no PhysX collision hulls in UE4, broken lampposts fell straight through car hoods, windshields, and roofs.
-- **Unnatural Propeller Spinning & Skyward Catapults:** The game explicitly injected artificial outward velocity vectors (`AddRandomOutwardVelocityToAllBodies`) and large upward launch impulses, causing fences to violently explode outward and light poles to windmill into the sky before floating down in slow motion.
+- **PhysX runs in an empty void:** Unreal Engine has no PhysX collision geometry for the city roads or terrain.
+- **Falling Through Ground:** Because there is no terrain collision in PhysX, broken props fell straight through the road and vanished into the void.
+- Grove Street Games attempted a crude workaround (`PhysicsFloor`), but despawned it after a few seconds (`RemoveFloor`), causing resting props to drop through the world and disappear forever.
 
 ---
 
 ## Features
 
 ### 1. Zero-Penetration Ground Barrier (No Falling Through the World)
-- Intercepts and permanently blocks `RemoveFloor` calls.
-- Dynamically scales and positions a $150\text{m} \times 150\text{m} \times 0.2\text{m}$ solid ground barrier centered at `contactZ - 10.0 cm`, keeping its top face perfectly flush with the road.
-- Debris rests solidly on the pavement and never falls through the map.
+- **Blocked Floor Removal:** Intercepts and permanently blocks `RemoveFloor` calls, ensuring the solid ground collision is never deleted.
+- **Flush Road Barrier:** Dynamically scales and positions a $150\text{m} \times 150\text{m} \times 0.2\text{m}$ solid ground barrier centered at `contactZ - 10.0 cm`, keeping its top face perfectly flush with the road surface.
+- **Detached Collision:** Detaches the floor component from the actor (`KeepWorld`) to break PhysX same-actor collision suppression.
+- Broken poles, traffic lights, and fences now solidly collide and rest on the pavement without falling through the map.
 
-### 2. Natural Rigid-Body Physics & Tipping (No Propeller Spin or Rocket Launch)
-- **Neutralized Velocity Injections:** Intercepts and drops calls to `AddRandomOutwardVelocityToAllBodies`, preventing chaotic explosive disassembly.
-- **Tamed Upward Launch:** Zeros out vertical launch impulses (`Impulse.Z = 0.0`) in `SetupBroken` and `AddImpulseAtLocationForAllBodiesBelow`.
-- **Realistic Bumper Tipping:** Preserves and moderates horizontal bumper momentum ($\le 800\text{ cm/s}$), shoving the base of the pole forward while the top lags behind from inertia, tipping over naturally like real steel/concrete posts.
-- **Natural Damping:** Configures natural linear damping (`0.05`) and angular damping (`0.40`) so objects fall with full $9.8\text{ m/s}^2$ gravitational acceleration and settle cleanly.
-
-### 3. Dynamic Kinematic Vehicle Collider (Cars Deflect Falling Props)
-- Re-purposes the prop's idle unbroken `Mesh` component into an invisible solid 3D PhysX collision box ($2.2\text{m wide} \times 4.8\text{m long} \times 1.4\text{m tall}$).
-- Positions the collider over the vehicle footprint at impact and kinematically translates it along the car's forward velocity vector for $2.5\text{ seconds}$ on the game thread.
-- **Result:** Falling poles physically bounce, roll, and deflect off your car's hood and roof instead of ghosting through your vehicle.
-
-### 4. Engine PhysX Substepping
-- Enables substepping on `PhysicsSettingsCore` at runtime (`MaxSubsteps = 4`, `MaxDelta = 0.0167s`), stabilizing high-speed physics solver calculations.
+### 2. Engine PhysX Substepping
+- Enables substepping on `Default__PhysicsSettingsCore` at runtime (`MaxSubsteps = 4`, `MaxDelta = 0.0167s`), eliminating collision tunneling during impacts.
 
 ---
 
@@ -49,7 +38,7 @@ When a streetlight or fence breaks, the game hands the fractured mesh (`BrokenMe
    ```text
    <GameRoot>\Gameface\Binaries\Win64\
    ```
-4. Launch the game. A log file named `GTA_Prop_Fix.log` will be generated in the same folder to confirm initialization.
+4. Launch the game. A log file named `GTA_Prop_Fix.log` will be generated in the same directory to confirm initialization.
 
 ---
 
@@ -62,7 +51,7 @@ When a streetlight or fence breaks, the game hands the fractured mesh (`BrokenMe
 ### Build Steps
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/GTA_Prop_Fix.git
+   git clone https://github.com/RAZORRZR0/GTA_Prop_Fix.git
    cd GTA_Prop_Fix
    ```
 2. Run `build.bat`:
