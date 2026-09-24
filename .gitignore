@@ -1,0 +1,16 @@
+# Build artifacts
+obj/
+*.obj
+*.exp
+*.lib
+*.log
+
+# Compiled plugins in root
+/*.asi
+
+# Visual Studio / IDE temporary files
+.vs/
+*.vcxproj.user
+*.suo
+*.user
+*.opendb
