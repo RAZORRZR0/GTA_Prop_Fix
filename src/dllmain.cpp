@@ -351,6 +351,7 @@ enum NameId {
     N_GetSocketLocation, N_GetSocketQuaternion, N_SetPhysicsLinearVelocity, N_SetPhysicsAngularVelocityInDegrees,
     N_GetNumBones, N_GetBoneName, N_IsSimulatingPhysics, N_SetEnableBodyGravity, N_PutRigidBodyToSleep, N_HideBoneByName,
     N_BreakConstraint, N_GetPhysicsLinearVelocity, N_SetAlpha, N_GetClosestPointOnCollision, N_GetMaterial, N_GetNumMaterials,
+    N_FindConstraintBoneName,
     N_COUNT
 };
 static const char* kNames[N_COUNT] = {
@@ -363,6 +364,7 @@ static const char* kNames[N_COUNT] = {
     "GetSocketLocation", "GetSocketQuaternion", "SetPhysicsLinearVelocity", "SetPhysicsAngularVelocityInDegrees",
     "GetNumBones", "GetBoneName", "IsSimulatingPhysics", "SetEnableBodyGravity", "PutRigidBodyToSleep", "HideBoneByName",
     "BreakConstraint", "GetPhysicsLinearVelocity", "SetAlpha", "GetClosestPointOnCollision", "GetMaterial", "GetNumMaterials",
+    "FindConstraintBoneName",
 };
 static volatile LONG g_nameIdx[N_COUNT];
 
@@ -1577,6 +1579,7 @@ struct PieceGroup {
     float life;        // steps left
     float cmdVn;       // velocity sent into the ground plane last update (cm/s, <0 = towards it)
     float sinkSpeed;   // fade: cm/s down through the ground so the piece is under it when its life ends
+    int8_t flat;       // local axis (0 x, 1 y, 2 z) the piece is thinnest along; -1 = unmeasured
     bool stopped, hidden;
 };
 struct PieceSet {
@@ -1649,20 +1652,50 @@ static void QuatRotate(const FQuat& q, const float v[3], float out[3]) {
     out[2] = v[2] + q.W * tz + (q.X * ty - q.Y * tx);
 }
 
+// Closest point on the piece's collision to `pt`. False when the body has no usable shape (returns -1).
+static bool ClosestOnPiece(void* mesh, FName bone, const float pt[3], float out[3]) {
+    alignas(16) uint8_t p[0x30] = {};
+    memcpy(p, pt, 12);                                       // Point
+    *(FName*)(p + 0x18) = bone;                              // BoneName
+    if (!Call(mesh, N_GetClosestPointOnCollision, p) || *(float*)(p + 0x20) <= 0.0f) return false;
+    memcpy(out, p + 0x0C, 12);                               // OutPointOnBody
+    return true;
+}
+
 // Height (cm) above the ground plane of the piece's lowest (dir = -1) or highest (dir = +1) collision point.
 // The closest point on the body to a point 1 km beyond it along the normal is its extreme point that way
-// (error <= size^2 / 2 km, 3 cm for an 8 m pole). False when the body has no usable shape (returns -1).
+// (error <= size^2 / 2 km, 3 cm for an 8 m pole).
 static bool PieceExtent(const PieceSet* s, FName bone, float dir, float& h) {
-    float loc[3];
+    float loc[3], pt[3], q[3];
     if (!BoneLocation(s->mesh, bone, loc)) return false;
-    alignas(16) uint8_t p[0x30] = {};
-    float* pt = (float*)p;                                   // Point
     for (int k = 0; k < 3; ++k) pt[k] = loc[k] + s->normal[k] * dir * 100000.0f;
-    *(FName*)(p + 0x18) = bone;                              // BoneName
-    if (!Call(s->mesh, N_GetClosestPointOnCollision, p) || *(float*)(p + 0x20) <= 0.0f) return false;
-    const float* q = (const float*)(p + 0x0C);               // OutPointOnBody
+    if (!ClosestOnPiece(s->mesh, bone, pt, q)) return false;
     h = (q[0] - s->ground[0]) * s->normal[0] + (q[1] - s->ground[1]) * s->normal[1] + (q[2] - s->ground[2]) * s->normal[2];
     return true;
+}
+
+// BreakObject_c::CalcGroupCenter: the local axis along which the piece is thinnest (its flat face normal),
+// measured on the piece's collision. An upright pole piece gets a horizontal axis, so it lies down.
+static int8_t FlattestAxis(void* mesh, FName bone) {
+    float loc[3];
+    FQuat q;
+    if (!BoneLocation(mesh, bone, loc) || !BoneQuat(mesh, bone, q)) return -1;
+    int8_t best = -1;
+    float bestSize = 1e9f;
+    for (int8_t k = 0; k < 3; ++k) {
+        float a[3] = {}, w[3];
+        a[k] = 1.0f;
+        QuatRotate(q, a, w);
+        float size = 0.0f;
+        for (float sgn = -1.0f; sgn <= 1.0f; sgn += 2.0f) {
+            float pt[3], c[3];
+            for (int j = 0; j < 3; ++j) pt[j] = loc[j] + w[j] * sgn * 100000.0f;
+            if (!ClosestOnPiece(mesh, bone, pt, c)) return -1;
+            size += sgn * ((c[0] - loc[0]) * w[0] + (c[1] - loc[1]) * w[1] + (c[2] - loc[2]) * w[2]);
+        }
+        if (size < bestSize) { bestSize = size; best = k; }
+    }
+    return best;
 }
 
 // SetupBroken just ran: take over the Blueprint's pieces. Returns false when the prop has no pieces to drive.
@@ -1698,6 +1731,21 @@ static bool InitOriginalPieces(void* actor, const SetupBrokenParms* p) {
         }
     }
 
+    // Independent pieces like the original groups: break every joint of the physics asset by its own joint
+    // name. Breaking only joints named after the simulated bones left DE's lamp post pieces jointed together.
+    int joints = 0;
+    for (int c = 0; c < 256; ++c) {
+        alignas(8) uint8_t fc[0x10] = {};
+        *(int32_t*)fc = c;
+        if (!Call(mesh, N_FindConstraintBoneName, fc)) break;
+        const FName joint = *(FName*)(fc + 4);
+        if (joint.Index == 0 && joint.Number == 0) break; // NAME_None: past the last constraint
+        alignas(8) uint8_t bc[0x30] = {};
+        *(FName*)(bc + 0x18) = joint;                     // zero impulse: the algorithm sets the velocity
+        Call(mesh, N_BreakConstraint, bc);
+        ++joints;
+    }
+
     alignas(8) uint8_t nb[0x10] = {};
     Call(mesh, N_GetNumBones, nb);
     const int numBones = *(int32_t*)nb;
@@ -1719,14 +1767,8 @@ static bool InitOriginalPieces(void* actor, const SetupBrokenParms* p) {
         const float len = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
         for (int k = 0; k < 3; ++k) g.axis[k] = len > 1e-4f ? ax[k] / len : (k == 2 ? 1.0f : 0.0f);
         g.life = life + RandRange(0.0f, 32.0f); // 256 + rand(32) frames in the original
-        // Independent pieces like the original groups: free DE's joints, gravity comes from the algorithm.
-        alignas(8) uint8_t bc[0x30] = {};
-        float loc[3] = {};
-        BoneLocation(mesh, bone, loc);
-        memcpy(bc + 0x0C, loc, 12);
-        *(FName*)(bc + 0x18) = bone;
-        Call(mesh, N_BreakConstraint, bc);
-        BodyGravity(mesh, bone, false);
+        g.flat = FlattestAxis(mesh, bone);
+        BodyGravity(mesh, bone, false);         // gravity comes from the algorithm
     }
     if (!s->n) { free(s); return false; }
     // Original pieces only ever touched their ground plane: ignore cars, peds, props and each other; block only
@@ -1745,8 +1787,8 @@ static bool InitOriginalPieces(void* actor, const SetupBrokenParms* p) {
         float h;
         if (PieceExtent(s, s->g[i].bone, -1.0f, h)) { ++measured; lowest = fminf(lowest, h); highest = fmaxf(highest, h); }
     }
-    Log(1, "original pieces: %d groups, break velocity (%.2f %.2f %.2f) +-%.2f m/step, ground z=%.0fcm, contact sensor=%s (%d/%d), "
-           "piece bottoms %.0f..%.0fcm above ground", s->n, bv[0], bv[1], bv[2], br, s->ground[2],
+    Log(1, "original pieces: %d groups, %d joints broken, break velocity (%.2f %.2f %.2f) +-%.2f m/step, ground z=%.0fcm, "
+           "contact sensor=%s (%d/%d), piece bottoms %.0f..%.0fcm above ground", s->n, joints, bv[0], bv[1], bv[2], br, s->ground[2],
         measured == s->n ? "collision" : measured ? "mixed" : "velocity", measured, s->n, measured ? lowest : 0.0f, measured ? highest : 0.0f);
     if (ShouldLog(ReadPtr(actor, UE::Obj_Class), 8, 60000)) {
         s->nextTrace = 10.0f; // trace the first groups of this class for a few seconds
@@ -1767,12 +1809,13 @@ static bool InitOriginalPieces(void* actor, const SetupBrokenParms* p) {
 }
 
 // Fade start (BreakObject_c::Render fades over the last 127.5 steps). DE's prop materials do not show
-// AGTAActor::SetAlpha, so the pieces also stop touching the ground plane and slide under the ground, each
-// at the speed that puts its top below the ground exactly when its own life ends.
+// AGTAActor::SetAlpha, so the pieces also stop touching the ground plane and slide under the ground. HideBoneByName
+// also hides a bone's children, so every piece is under the ground by the time the first one hides.
 static void StartSinking(PieceSet* s) {
     s->sinking = true;
     ChannelResponse(s->mesh, 7, 0); // ignore the ground plane (the only thing the pieces touch)
-    float deepest = 0.0f;
+    float deepest = 0.0f, minLife = 1e9f;
+    for (int i = 0; i < s->n; ++i) if (!s->g[i].hidden) minLife = fminf(minLife, s->g[i].life);
     for (int i = 0; i < s->n; ++i) {
         PieceGroup& g = s->g[i];
         if (g.hidden) continue;
@@ -1784,7 +1827,7 @@ static void StartSinking(PieceSet* s) {
         }
         const float depth = fmaxf(top, 0.0f) + 5.0f;
         deepest = fmaxf(deepest, depth);
-        g.sinkSpeed = depth / fmaxf(g.life, 1.0f) * 50.0f; // cm per remaining step -> cm/s
+        g.sinkSpeed = depth / fmaxf(minLife, 1.0f) * 50.0f; // cm per remaining step -> cm/s
         if (g.stopped) BodyGravity(s->mesh, g.bone, false); // the sink speed alone moves it
     }
     Log(s->nextTrace > 0.0f ? 1 : 2, "  fade: %d groups sink under the ground (up to %.0fcm) over %.1fs", s->n, deepest,
@@ -1839,18 +1882,19 @@ static bool UpdatePieceSet(PieceSet* s, float step) {
         float ang[3] = {};
         if (s->steps < 5.0f) {     // initial tumble
             for (int k = 0; k < 3; ++k) ang[k] = g.axis[k] * g.rotSpeed * 50.0f;
-        } else {                    // turn the piece's flattest face towards the ground normal
+        } else {                    // turn the piece's flat face (thinnest axis) towards the ground normal
             FQuat q;
             if (BoneQuat(s->mesh, g.bone, q)) {
-                const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
                 float best[3] = {}, bestDot = -1.0f;
-                for (auto& a : axes) {
-                    float w[3];
+                for (int8_t k = 0; k < 3; ++k) {
+                    if (g.flat >= 0 && k != g.flat) continue; // unmeasured: the axis nearest the normal
+                    float a[3] = {}, w[3];
+                    a[k] = 1.0f;
                     QuatRotate(q, a, w);
                     float d = w[0] * s->normal[0] + w[1] * s->normal[1] + w[2] * s->normal[2];
                     if (fabsf(d) > bestDot) {
                         bestDot = fabsf(d);
-                        for (int k = 0; k < 3; ++k) best[k] = d < 0 ? -w[k] : w[k];
+                        for (int j = 0; j < 3; ++j) best[j] = d < 0 ? -w[j] : w[j];
                     }
                 }
                 const float angle = acosf(fminf(1.0f, bestDot));
