@@ -275,6 +275,7 @@ constexpr uint32_t ObjFlag_IsLampPost = 0x100;
 constexpr size_t Entity_ObjectInfo = 0x1DC;    // CObjectInfo* (unaligned in the x64 layout)
 constexpr size_t Entity_PhysicalFlags = 0x78; // bit 2 = bDisableCollisionForce
 constexpr uint32_t PhysFlag_DisableCollisionForce = 0x04;
+constexpr uint32_t PhysFlag_DisableMoveForce = 0x20; // swing/lock doors (object.dat SWINGDOOR/LOCKDOOR); tested by DE's SetIsStatic
 constexpr size_t ObjectInfo_UprootLimit = 0x14;
 constexpr size_t ObjectInfo_ColDamageMult = 0x18;
 constexpr size_t ObjectInfo_BreakVelocity = 0x3C;     // CVector m_vecBreakVelocity (after the 8-byte fx pointer at 0x30, smash mult at 0x38)
@@ -1035,7 +1036,10 @@ static void Hooked_SetIsStatic(void* entity, bool isStatic) {
     }
 
     void* actor = nullptr;
+    // Hinged doors keep DE's own handling: the Blueprint's Dislodged swings the door actor. Taking them over
+    // left the actor closed while RenderWare opened the door, so the player walked through it.
     const bool dislodge = g_cfg.rwDislodgedProps && entity && IsObjectEntity(entity) &&
+                          !(*(uint32_t*)((uint8_t*)entity + GTA::Entity_PhysicalFlags) & GTA::PhysFlag_DisableMoveForce) &&
                           (actor = EntityActor(entity)) != nullptr && IsDynamicPropActor(actor);
     if (!dislodge) { o_SetIsStatic(entity, isStatic); return; }
 

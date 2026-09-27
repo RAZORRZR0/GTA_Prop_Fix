@@ -20,7 +20,7 @@ When a streetlight or fence breaks, the game hands the fractured mesh (`BrokenMe
 
 ### 1. Knocked-over props use the original RenderWare physics
 DE still runs the original `CObject`/`CPhysical` simulation after a prop is knocked loose (`CObject::SetIsStatic(false)`). The only change is that it also fires the Blueprint event `Dislodged`, which hands the actor to UE PhysX, and PhysX has no world collision. The plugin:
-- suppresses that hand-off for every `DynamicIPLMapActor` prop;
+- suppresses that hand-off for every `DynamicIPLMapActor` prop, except hinged doors (object.dat `SWINGDOOR`/`LOCKDOOR`, `bDisableMoveForce`), which keep DE's own door handling;
 - copies the RenderWare matrix to the actor after each collision/shift step, so the prop collides with roads, buildings and cars using its `object.dat` mass, uproot limit and elasticity;
 - switches street lights off once they tilt (`up.z < 0.96`, as in `CEntity::ProcessLightsForEntity`);
 - takes a prop over only when its RenderWare collision box covers at least 60% of its visible height (`MinCollisionCoveragePercent`) **and** its solid collision shapes (spheres, boxes, triangles) fill at least 70% of that box (`MinShapeCoveragePercent`). Some DE poles only have collision at the base. RenderWare physics would leave those hanging from the base under the road, so street lights of that kind are broken the DE way (on the ground plane below), and other props keep stock behaviour.

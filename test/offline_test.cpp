@@ -306,6 +306,16 @@ static void TestLogic() {
     CHECK(Called(actor, N_Dislodged));
     g_cfg.rwDislodgedProps = true;
 
+    // Interior door (object.dat SWINGDOOR: bDisableMoveForce): DE's Blueprint swings the actor on Dislodged.
+    // Regression: the plugin took doors over, the actor stayed closed and the player walked through it.
+    g_calls.clear();
+    *(uint32_t*)(entity->mem + GTA::Entity_Flags) = GTA::Flag_IsStatic;
+    *(uint32_t*)(entity->mem + GTA::Entity_PhysicalFlags) |= GTA::PhysFlag_DisableMoveForce;
+    Hooked_SetIsStatic(entity, false);
+    CHECK(Called(actor, N_Dislodged) && FindDislodged(entity) < 0);
+    Hooked_SetIsStatic(entity, true);
+    *(uint32_t*)(entity->mem + GTA::Entity_PhysicalFlags) &= ~GTA::PhysFlag_DisableMoveForce;
+
     // RemoveFloor lifetime modes.
     g_calls.clear();
     g_cfg.debrisMode = DEBRIS_ORIGINAL;
